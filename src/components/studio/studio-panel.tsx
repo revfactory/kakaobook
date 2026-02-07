@@ -59,10 +59,11 @@ interface StudioPanelProps {
 export function StudioPanel({ notebookId }: StudioPanelProps) {
   const [showInfographicModal, setShowInfographicModal] = useState(false);
   const [showSlideModal, setShowSlideModal] = useState(false);
-  const [viewingOutput, setViewingOutput] = useState<StudioOutput | null>(null);
+  const [viewingOutputId, setViewingOutputId] = useState<string | null>(null);
   const [deletingOutputId, setDeletingOutputId] = useState<string | null>(null);
 
   const { data: outputs = [] } = useStudioOutputs(notebookId);
+  const viewingOutput = outputs.find((o) => o.id === viewingOutputId) || null;
   const deleteOutput = useDeleteStudioOutput();
   const retryOutput = useRetryStudioOutput();
 
@@ -143,7 +144,7 @@ export function StudioPanel({ notebookId }: StudioPanelProps) {
                   <div
                     key={output.id}
                     className="flex items-center gap-2 px-2 py-2 rounded-md hover:bg-gray-50 group cursor-pointer"
-                    onClick={() => setViewingOutput(output)}
+                    onClick={() => setViewingOutputId(output.id)}
                   >
                     {OUTPUT_ICONS[output.type] || (
                       <Image className="w-4 h-4 text-text-muted" />
@@ -163,7 +164,21 @@ export function StudioPanel({ notebookId }: StudioPanelProps) {
                     </div>
 
                     {output.generation_status === "generating" && !isStuck(output) ? (
-                      <Loader2 className="w-4 h-4 text-brand animate-spin" />
+                      <div className="flex items-center gap-1.5">
+                        <Loader2 className="w-4 h-4 text-brand animate-spin shrink-0" />
+                        {(() => {
+                          const progress = (output.content as Record<string, unknown>)?.progress as
+                            { completed?: number; total?: number } | undefined;
+                          if (progress?.total) {
+                            return (
+                              <span className="text-[11px] text-text-muted whitespace-nowrap">
+                                {progress.completed || 0}/{progress.total}
+                              </span>
+                            );
+                          }
+                          return null;
+                        })()}
+                      </div>
                     ) : output.generation_status === "failed" || isStuck(output) ? (
                       <div className="flex items-center gap-1">
                         <AlertCircle className="w-4 h-4 text-error shrink-0" />
@@ -269,7 +284,7 @@ export function StudioPanel({ notebookId }: StudioPanelProps) {
       {viewingOutput && (
         <ContentViewer
           output={viewingOutput}
-          onClose={() => setViewingOutput(null)}
+          onClose={() => setViewingOutputId(null)}
         />
       )}
 

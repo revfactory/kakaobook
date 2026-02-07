@@ -101,7 +101,7 @@ ${sourceContext}`;
           user_id: user.id,
           role: "assistant" as const,
           content: fullContent,
-          model: "gemini-2.5-flash",
+          model: "gemini-3-flash-preview",
         });
       }
     };

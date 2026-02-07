@@ -1,4 +1,4 @@
-import { NextResponse } from "next/server";
+import { NextResponse, after } from "next/server";
 import { createServerSupabaseClient, createServiceRoleClient } from "@/lib/supabase/server";
 import { generateInfographicImage } from "@/lib/ai/nano-banana";
 import { generateText } from "@/lib/ai/gemini";
@@ -61,25 +61,28 @@ export async function POST(request: Request) {
       );
     }
 
-    // Generate in background with service role client (request context independent)
+    // Generate in background using after() to keep serverless function alive
     const adminClient = await createServiceRoleClient();
-    (async () => {
+    const outputId = output.id;
+    const userId = user.id;
+
+    after(async () => {
       try {
-        console.log(`[Infographic ${output.id}] 생성 시작 - 소스 ${sources.length}개`);
+        console.log(`[Infographic ${outputId}] 생성 시작 - 소스 ${sources.length}개`);
 
         // Summarize sources for infographic content
         const sourceTexts = sources
           .map((s) => `[${s.title}]\n${(s.extracted_text || "").slice(0, 5000)}`)
           .join("\n\n");
 
-        console.log(`[Infographic ${output.id}] Gemini 요약 요청 중...`);
+        console.log(`[Infographic ${outputId}] Gemini 요약 요청 중...`);
         const sourceContent = await generateText(
           `다음 소스 내용에서 인포그래픽에 포함할 핵심 데이터 포인트, 통계, 주요 개념을 추출하세요. 글머리 기호로 정리해주세요:\n\n${sourceTexts.slice(0, 20000)}`
         );
-        console.log(`[Infographic ${output.id}] Gemini 요약 완료`);
+        console.log(`[Infographic ${outputId}] Gemini 요약 완료`);
 
         // Generate infographic image
-        console.log(`[Infographic ${output.id}] 이미지 생성 중...`);
+        console.log(`[Infographic ${outputId}] 이미지 생성 중...`);
         const { imageData, mimeType } = await generateInfographicImage({
           sourceContent,
           language,
@@ -87,14 +90,14 @@ export async function POST(request: Request) {
           detailLevel,
           userPrompt: prompt,
         });
-        console.log(`[Infographic ${output.id}] 이미지 생성 완료 (${mimeType})`);
+        console.log(`[Infographic ${outputId}] 이미지 생성 완료 (${mimeType})`);
 
         // Upload image to storage
         const ext = mimeType.includes("png") ? "png" : "jpg";
-        const filePath = `${user.id}/outputs/${output.id}.${ext}`;
+        const filePath = `${userId}/outputs/${outputId}.${ext}`;
         const imageBuffer = Buffer.from(imageData, "base64");
 
-        console.log(`[Infographic ${output.id}] Storage 업로드 중...`);
+        console.log(`[Infographic ${outputId}] Storage 업로드 중...`);
         await adminClient.storage
           .from("studio")
           .upload(filePath, imageBuffer, {
@@ -112,11 +115,11 @@ export async function POST(request: Request) {
             image_urls: [publicUrl],
             generation_status: "completed",
           })
-          .eq("id", output.id);
+          .eq("id", outputId);
 
-        console.log(`[Infographic ${output.id}] ✅ 생성 완료`);
+        console.log(`[Infographic ${outputId}] ✅ 생성 완료`);
       } catch (error) {
-        console.error(`[Infographic ${output.id}] ❌ 생성 실패:`, error);
+        console.error(`[Infographic ${outputId}] ❌ 생성 실패:`, error);
         await adminClient
           .from("studio_outputs")
           .update({
@@ -124,9 +127,9 @@ export async function POST(request: Request) {
             error_message:
               error instanceof Error ? error.message : "생성 실패",
           })
-          .eq("id", output.id);
+          .eq("id", outputId);
       }
-    })();
+    });
 
     return NextResponse.json({ id: output.id, status: "generating" });
   } catch (error) {

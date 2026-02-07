@@ -24,7 +24,7 @@ export function useStudioOutputs(notebookId: string) {
       const hasGenerating = query.state.data?.some(
         (o) => o.generation_status === "generating"
       );
-      return hasGenerating ? 3000 : false;
+      return hasGenerating ? 2000 : false;
     },
   });
 }

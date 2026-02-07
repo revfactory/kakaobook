@@ -1,7 +1,34 @@
-import { NextResponse } from "next/server";
+import { NextResponse, after } from "next/server";
 import { createServerSupabaseClient, createServiceRoleClient } from "@/lib/supabase/server";
 import { generateSlideImage } from "@/lib/ai/nano-banana";
 import { generateText } from "@/lib/ai/gemini";
+
+async function runWithConcurrency<T>(
+  tasks: (() => Promise<T>)[],
+  limit: number
+): Promise<PromiseSettledResult<T>[]> {
+  const results: PromiseSettledResult<T>[] = new Array(tasks.length);
+  let nextIndex = 0;
+
+  async function worker() {
+    while (nextIndex < tasks.length) {
+      const index = nextIndex++;
+      try {
+        const value = await tasks[index]();
+        results[index] = { status: "fulfilled", value };
+      } catch (reason) {
+        results[index] = { status: "rejected", reason };
+      }
+    }
+  }
+
+  const workers = Array.from(
+    { length: Math.min(limit, tasks.length) },
+    () => worker()
+  );
+  await Promise.all(workers);
+  return results;
+}
 
 export async function POST(request: Request) {
   try {
@@ -61,11 +88,24 @@ export async function POST(request: Request) {
       );
     }
 
-    // Generate in background with service role client (request context independent)
+    // Generate in background using after() to keep serverless function alive
     const adminClient = await createServiceRoleClient();
-    (async () => {
+    const outputId = output.id;
+    const userId = user.id;
+
+    after(async () => {
       try {
-        console.log(`[Slides ${output.id}] 생성 시작 - 소스 ${sources.length}개`);
+        console.log(`[Slides ${outputId}] 생성 시작 - 소스 ${sources.length}개`);
+
+        // Update progress: outline phase
+        await adminClient
+          .from("studio_outputs")
+          .update({
+            content: {
+              progress: { phase: "아웃라인 생성", completed: 0, total: 0, failed: 0 },
+            },
+          })
+          .eq("id", outputId);
 
         const sourceTexts = sources
           .map(
@@ -83,7 +123,7 @@ export async function POST(request: Request) {
             : "8-12";
 
         // Generate slide outline with Gemini
-        console.log(`[Slides ${output.id}] Gemini 아웃라인 생성 중...`);
+        console.log(`[Slides ${outputId}] Gemini 아웃라인 생성 중...`);
         const outlinePrompt = `다음 소스 내용을 기반으로 ${slideCountRange}장의 슬라이드 아웃라인을 JSON 형식으로 생성해주세요.
 
 소스 내용:
@@ -109,17 +149,31 @@ ${prompt ? `추가 지시사항: ${prompt}` : ""}
             { title: "개요", content: "프레젠테이션 개요 슬라이드입니다." },
           ];
         }
-        console.log(`[Slides ${output.id}] 아웃라인 완료 - ${slides.length}장`);
+        console.log(`[Slides ${outputId}] 아웃라인 완료 - ${slides.length}장`);
 
         // Determine topic
         const topic = slides[0]?.title || "프레젠테이션";
 
-        // Generate images sequentially (to respect rate limits)
-        const imageUrls: string[] = [];
+        // Update progress: image generation phase starts
+        await adminClient
+          .from("studio_outputs")
+          .update({
+            content: {
+              slides,
+              progress: { phase: "이미지 생성", completed: 0, total: slides.length, failed: 0 },
+            },
+            image_urls: [],
+          })
+          .eq("id", outputId);
 
-        for (let i = 0; i < slides.length; i++) {
-          const slide = slides[i];
-          console.log(`[Slides ${output.id}] 슬라이드 ${i + 1}/${slides.length} 이미지 생성 중...`);
+        // Generate images in parallel (concurrency limit: 3)
+        const CONCURRENCY_LIMIT = 3;
+        const imageUrls: (string | null)[] = new Array(slides.length).fill(null);
+        let completedCount = 0;
+        let failedCount = 0;
+
+        const tasks = slides.map((slide, i) => async () => {
+          console.log(`[Slides ${outputId}] 슬라이드 ${i + 1}/${slides.length} 이미지 생성 중...`);
 
           const { imageData, mimeType } = await generateSlideImage({
             slideNumber: i + 1,
@@ -134,7 +188,7 @@ ${prompt ? `추가 지시사항: ${prompt}` : ""}
 
           // Upload
           const ext = mimeType.includes("png") ? "png" : "jpg";
-          const filePath = `${user.id}/outputs/${output.id}-slide-${i + 1}.${ext}`;
+          const filePath = `${userId}/outputs/${outputId}-slide-${i + 1}.${ext}`;
           const imageBuffer = Buffer.from(imageData, "base64");
 
           await adminClient.storage
@@ -145,23 +199,72 @@ ${prompt ? `추가 지시사항: ${prompt}` : ""}
             data: { publicUrl },
           } = adminClient.storage.from("studio").getPublicUrl(filePath);
 
-          imageUrls.push(publicUrl);
-          console.log(`[Slides ${output.id}] 슬라이드 ${i + 1}/${slides.length} 완료`);
+          imageUrls[i] = publicUrl;
+          completedCount++;
+
+          // Incremental DB update: progress + ordered URLs
+          const orderedUrls: string[] = [];
+          for (let j = 0; j < slides.length; j++) {
+            if (imageUrls[j] !== null) orderedUrls.push(imageUrls[j]!);
+          }
+
+          await adminClient
+            .from("studio_outputs")
+            .update({
+              image_urls: orderedUrls,
+              content: {
+                slides,
+                progress: {
+                  phase: "이미지 생성",
+                  completed: completedCount,
+                  total: slides.length,
+                  failed: failedCount,
+                },
+              },
+            })
+            .eq("id", outputId);
+
+          console.log(`[Slides ${outputId}] 슬라이드 ${i + 1}/${slides.length} 완료 (${completedCount}/${slides.length})`);
+          return publicUrl;
+        });
+
+        const results = await runWithConcurrency(tasks, CONCURRENCY_LIMIT);
+
+        // Count failures
+        const failures = results.filter((r) => r.status === "rejected");
+        failedCount = failures.length;
+
+        // Final ordered URLs
+        const finalUrls: string[] = [];
+        for (let j = 0; j < slides.length; j++) {
+          if (imageUrls[j] !== null) finalUrls.push(imageUrls[j]!);
         }
 
-        // Update output
+        if (finalUrls.length === 0) {
+          throw new Error("모든 슬라이드 이미지 생성에 실패했습니다.");
+        }
+
+        // Final update
         await adminClient
           .from("studio_outputs")
           .update({
-            image_urls: imageUrls,
-            content: { slides },
+            image_urls: finalUrls,
+            content: {
+              slides,
+              progress: {
+                phase: "완료",
+                completed: completedCount,
+                total: slides.length,
+                failed: failedCount,
+              },
+            },
             generation_status: "completed",
           })
-          .eq("id", output.id);
+          .eq("id", outputId);
 
-        console.log(`[Slides ${output.id}] ✅ 전체 생성 완료 - ${imageUrls.length}장`);
+        console.log(`[Slides ${outputId}] ✅ 전체 생성 완료 - ${finalUrls.length}장 (실패: ${failedCount}장)`);
       } catch (error) {
-        console.error(`[Slides ${output.id}] ❌ 생성 실패:`, error);
+        console.error(`[Slides ${outputId}] ❌ 생성 실패:`, error);
         await adminClient
           .from("studio_outputs")
           .update({
@@ -169,9 +272,9 @@ ${prompt ? `추가 지시사항: ${prompt}` : ""}
             error_message:
               error instanceof Error ? error.message : "생성 실패",
           })
-          .eq("id", output.id);
+          .eq("id", outputId);
       }
-    })();
+    });
 
     return NextResponse.json({ id: output.id, status: "generating" });
   } catch (error) {
