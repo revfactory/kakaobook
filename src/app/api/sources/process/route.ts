@@ -123,6 +123,15 @@ export async function POST(request: Request) {
             const buffer = await fileData.arrayBuffer();
             extractedText = await extractTextFromPdf(buffer);
           }
+        } else if (source.type === "text" && source.file_path) {
+          // Download text-based files (.md, .txt, .csv) from storage
+          const { data: fileData } = await serviceClient.storage
+            .from("sources")
+            .download(source.file_path);
+
+          if (fileData) {
+            extractedText = await fileData.text();
+          }
         } else if (source.type === "text") {
           extractedText = source.extracted_text || "";
         }
